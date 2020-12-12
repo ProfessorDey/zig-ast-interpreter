@@ -14,28 +14,6 @@ const Allocator = std.mem.Allocator;
 const ImmutableAssignments = false;
 const MaxDepth = 300;
 
-// === Scalar Values ===
-// As in any language there is a limited way to represent scalar values,
-// in this case all numeric values are 32 bits wide and text is treated
-// as always being in UTF-8 format
-const ScalarTypes = enum {
-    integer,
-    unsigned,
-    float,
-    boolean,
-    character,
-    string,
-};
-
-const Scalar = union(ScalarTypes) {
-    integer: i32,
-    unsigned: u32,
-    float: f32,
-    boolean: bool,
-    character: u8,
-    string: []const u8,
-};
-
 // === Assignment Parameters ===
 // In order to be as flexible as possible and allow for userland access
 // to lambdas and error streams, the assignment directly contains the
@@ -68,18 +46,18 @@ const Closure = struct {
 };
 
 // === Function Call Parameters ===
-// To keep complexity lower, the system only allows for scalar values and
-// closures to be considered valid arguments for function calls. This thus
-// excludes errors as they presently lack a defined type, this could be
-// changed in order to allow functions to explicitly accept Errors, as
-// the Error interface is too simplistic at present to include computable
-// information.
+// Defines every valid type that can be received by a function, including
+// scalar values, void, lambdas and error lists.
 const ArgumentTypes = union(enum) {
-    void: u1,
-    scalar: ScalarTypes,
+    void: struct {},
+    integer: i32,
+    unsigned: u32,
+    float: f32,
+    boolean: bool,
+    character: u8,
+    string: []const u8,
     lambda: *const ClosureT,
     errlst: usize,
-    any: u1,
 };
 
 const CallParameters = struct {
@@ -94,11 +72,16 @@ const Action = union(enum) {
 };
 
 const ResolvedAction = union(enum) {
-    scalar: Scalar,
+    integer: i32,
+    unsigned: u32,
+    float: f32,
+    boolean: bool,
+    character: u8,
+    string: []const u8,
     call: CallParameters,
     lambda: Closure,
     errlst: ArrayList(ErrorEntry),
-    void: u1,
+    void: struct {},
 };
 
 // === Type Resolution ===
@@ -107,26 +90,21 @@ const ResolvedAction = union(enum) {
 // for lambdas with their embedded type signatures
 pub fn getType(ra: ResolvedAction) ArgumentTypes {
     return switch (ra) {
-        .scalar => |s| ArgumentTypes{
-            .scalar = switch (s) {
-                .integer => ScalarTypes.integer,
-                .unsigned => ScalarTypes.unsigned,
-                .float => ScalarTypes.float,
-                .boolean => ScalarTypes.boolean,
-                .character => ScalarTypes.character,
-                .string => ScalarTypes.string,
-            },
-        },
+        .integer => ArgumentTypes{ .integer = -1 },
+        .unsigned => ArgumentTypes{ .unsigned = 0 },
+        .float => ArgumentTypes{ .float = 1.0 },
+        .boolean => ArgumentTypes{ .boolean = true },
+        .character => ArgumentTypes{ .character = 'A' },
+        .string => ArgumentTypes{ .string = "" },
         .call => |c| c.returnType,
         .lambda => |l| ArgumentTypes{ .lambda = &l.typeSignature },
         .errlst => |e| ArgumentTypes{ .errlst = e.items.len },
-        .void => ArgumentTypes{ .void = 0 },
+        .void => ArgumentTypes{ .void = .{} },
     };
 }
 
 pub fn isAcceptedType(t1: ArgumentTypes, t2: ArgumentTypes) bool {
     return switch (t2) {
-        .any => true,
         .void => switch (t1) {
             .void => true,
             else => false,
@@ -135,12 +113,32 @@ pub fn isAcceptedType(t1: ArgumentTypes, t2: ArgumentTypes) bool {
             .lambda => |l1| (l1 == l2),
             else => false,
         },
-        .scalar => |s2| switch (t1) {
-            .scalar => |s1| (s1 == s2),
+        .errlst => switch (t1) {
+            .errlst => true,
             else => false,
         },
-        .errlst => |e2| switch (t1) {
-            .errlst => true,
+        .integer => switch (t1) {
+            .integer => true,
+            else => false,
+        },
+        .unsigned => switch (t1) {
+            .unsigned => true,
+            else => false,
+        },
+        .float => switch (t1) {
+            .float => true,
+            else => false,
+        },
+        .boolean => switch (t1) {
+            .boolean => true,
+            else => false,
+        },
+        .character => switch (t1) {
+            .character => true,
+            else => false,
+        },
+        .string => switch (t1) {
+            .string => true,
             else => false,
         },
     };
@@ -155,17 +153,28 @@ const ErrorEntry = struct {
 };
 
 fn makeError(target: []const u8, msg: []const u8, alloc: *Allocator) ResolvedAction {
-    var errEntry = [_]ErrorEntry{ErrorEntry{ .target = target, .msg = msg }};
-    return ResolvedAction{ .errlst = ArrayList(ErrorEntry).fromOwnedSlice(alloc, errEntry[0..]) };
+    var errLst = ArrayList(ErrorEntry).initCapacity(alloc, 1) catch {
+        return ResolvedAction{ .void = .{} };
+    };
+    var errEntry = ErrorEntry{
+        .target = target,
+        .msg = msg,
+    };
+    errLst.appendAssumeCapacity(errEntry);
+    return ResolvedAction{ .errlst = errLst };
 }
 
 fn appendError(ra: *ResolvedAction, target: []const u8, msg: []const u8, alloc: *Allocator) ResolvedAction {
     switch (ra.*) {
-        .errlst => |elist| {
+        .errlst => {
             var errEntry = ErrorEntry{ .target = target, .msg = msg };
-            ra.errlst.append(errEntry) catch
-                return makeError(target, "Failed to append error to error list, ironic.", alloc);
-            return ResolvedAction{ .errlst = ra.errlst };
+            var originalLength = ra.errlst.capacity;
+            var newErrorList = ArrayList(ErrorEntry).initCapacity(alloc, ra.errlst.capacity + 1) catch
+                return makeError(target, "Not enough memory to reallocate error list", alloc);
+            newErrorList.appendSliceAssumeCapacity(ra.errlst.toOwnedSlice());
+            newErrorList.appendAssumeCapacity(errEntry);
+            ra.errlst.deinit();
+            return ResolvedAction{ .errlst = newErrorList };
         },
         else => return makeError(target, msg, alloc),
     }
@@ -307,14 +316,14 @@ fn execute(lambda: Closure, current: *HashMap(Assignment), scopes: *ArrayList(*H
         };
         if (current.get("lambda_return_value")) |ret| {
             if (isAcceptedType(getType(ret.value), lambda.typeSignature.returnType)) {
-                return makeError(ret.name, "Value does not match expected return type", alloc);
-            } else {
                 return ret.value;
+            } else {
+                return makeError(ret.name, "Value does not match expected return type", alloc);
             }
         }
     }
     current.deinit();
-    return ResolvedAction{ .void = 0 };
+    return ResolvedAction{ .void = .{} };
 }
 
 fn resolve(ra: ResolvedAction, scopes: *ArrayList(*HashMap(Assignment)), alloc: *Allocator) ResolvedAction {
@@ -337,14 +346,12 @@ fn resolve(ra: ResolvedAction, scopes: *ArrayList(*HashMap(Assignment)), alloc: 
 // As most debugging is rather challenging to do at compile time
 // these functions are specifically intended to stringify values
 // for console level debugging output.
-fn concatStrings(arr: *ArrayList([]const u8), alloc: *Allocator) []const u8 {
+fn concatStrings(arr: ArrayList([]const u8), alloc: *Allocator) Allocator.Error![]const u8 {
     var length: usize = 0;
     for (arr.items) |str| {
         length += str.len;
     }
-    var buffer = alloc.alloc(u8, length) catch {
-        return "";
-    };
+    var buffer = try alloc.alloc(u8, length);
     length = 0;
     for (arr.items) |str| {
         std.mem.copy(u8, buffer[length..], str);
@@ -353,33 +360,52 @@ fn concatStrings(arr: *ArrayList([]const u8), alloc: *Allocator) []const u8 {
     return buffer;
 }
 
-fn lambdaTypeString(cT: *const ClosureT, alloc: *Allocator) []const u8 {
+fn lambdaTypeString(cT: *const ClosureT, alloc: *Allocator) Allocator.Error![]const u8 {
     var argStrings = ArrayList([]const u8).init(alloc);
     defer argStrings.deinit();
-    argStrings.append("Lambda: (") catch return "";
+    try argStrings.append("Lambda: (");
     for (cT.argumentList.items) |sig| {
-        argStrings.append(typeString(sig.argT, alloc)) catch return "";
-        argStrings.append(" -> ") catch return "";
+        var tyStr = try typeString(sig.argT, alloc);
+        try argStrings.append(tyStr);
+        try argStrings.append(" -> ");
     }
-    argStrings.append(typeString(cT.returnType, alloc)) catch return "";
-    argStrings.append(")") catch return "";
-    return concatStrings(&argStrings, alloc);
+    var retStr = try typeString(cT.returnType, alloc);
+    try argStrings.append(retStr);
+    try argStrings.append(")");
+    var str = concatStrings(argStrings, alloc);
+    alloc.free(retStr);
+    return str;
 }
 
-fn typeString(t: ArgumentTypes, alloc: *Allocator) []const u8 {
+fn printErrorList(errlst: ArrayList(ErrorEntry)) !void {
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("Error List:\n", .{});
+    for (errlst.items) |errorEntry| {
+        try stdout.print("[Target: {}] Message: {}.\n", .{ errorEntry.target, errorEntry.msg });
+    }
+}
+
+// This has to copy any compile time known strings into a buffer to
+// ensure a consistant interface, otherwise the caller would have
+// to check the type of t to see if it was a lambda, which would
+// be the only option that does allocate memory.
+fn mkBuffer(str: []const u8, alloc: *Allocator) Allocator.Error![]const u8 {
+    var buffer = try alloc.alloc(u8, str.len);
+    std.mem.copy(u8, buffer[0..], str);
+    return buffer;
+}
+
+fn typeString(t: ArgumentTypes, alloc: *Allocator) Allocator.Error![]const u8 {
     return switch (t) {
-        .scalar => |s| switch (s) {
-            .integer => "ScalarTypes.integer",
-            .unsigned => "ScalarTypes.unsigned",
-            .float => "ScalarTypes.float",
-            .boolean => "ScalarTypes.boolean",
-            .character => "ScalarTypes.character",
-            .string => "ScalarTypes.string",
-        },
         .lambda => |l| lambdaTypeString(l, alloc),
-        .errlst => "Error List",
-        .void => "Void",
-        .any => "Any",
+        .errlst => mkBuffer("Error List", alloc),
+        .void => mkBuffer("Void", alloc),
+        .integer => mkBuffer("Integer", alloc),
+        .unsigned => mkBuffer("Unsigned", alloc),
+        .float => mkBuffer("Float", alloc),
+        .boolean => mkBuffer("Boolean", alloc),
+        .character => mkBuffer("Character", alloc),
+        .string => mkBuffer("String", alloc),
     };
 }
 
@@ -389,44 +415,65 @@ fn typeString(t: ArgumentTypes, alloc: *Allocator) []const u8 {
 // be seen below.
 test "Type checking tests" {
     var alloc = std.testing.allocator;
-    var a = ResolvedAction{ .void = 0 };
-    var b = ResolvedAction{ .scalar = Scalar{ .integer = 5 } };
+    var a = ResolvedAction{ .void = .{} };
+    var b = ResolvedAction{ .integer = 5 };
     var c = ResolvedAction{
         .call = CallParameters{
             .target = "test",
             .arguments = ArrayList([]const u8).init(alloc),
-            .returnType = ArgumentTypes{ .void = 0 },
+            .returnType = ArgumentTypes{ .void = .{} },
         },
     };
     var d = ResolvedAction{
         .lambda = Closure{
             .typeSignature = ClosureT{
                 .argumentList = ArrayList(Signature).init(alloc),
-                .returnType = ArgumentTypes{ .void = 0 },
+                .returnType = ArgumentTypes{ .void = .{} },
             },
             .procedures = ArrayList(Action).init(alloc),
         },
     };
     const stdout = std.io.getStdOut().writer();
-    var aTS = typeString(getType(a), alloc);
-    defer alloc.free(aTS);
-    try stdout.print("The value of 'a' is of type: [{}]\n", .{aTS});
-    std.testing.expect(isAcceptedType(getType(a), ArgumentTypes{ .void = 0 }));
+    var aTS = try typeString(getType(a), alloc);
+    try stdout.print("\nThe value of 'a' is of type: [{}]\n", .{aTS});
+    std.testing.expect(isAcceptedType(getType(a), ArgumentTypes{ .void = .{} }));
+    alloc.free(aTS);
 
-    var bTS = typeString(getType(b), alloc);
-    defer alloc.free(bTS);
+    var bTS = try typeString(getType(b), alloc);
     try stdout.print("The value of 'b' is of type: [{}]\n", .{bTS});
-    std.testing.expect(isAcceptedType(getType(b), ArgumentTypes{ .scalar = ScalarTypes.integer }));
+    std.testing.expect(isAcceptedType(getType(b), ArgumentTypes{ .integer = -1 }));
+    alloc.free(bTS);
 
-    var cTS = typeString(getType(c), alloc);
-    defer alloc.free(cTS);
+    var cTS = try typeString(getType(c), alloc);
     try stdout.print("The value of 'c' is of type: [{}]\n", .{cTS});
-    std.testing.expect(isAcceptedType(getType(c), ArgumentTypes{ .void = 0 }));
+    std.testing.expect(isAcceptedType(getType(c), ArgumentTypes{ .void = .{} }));
+    alloc.free(cTS);
 
-    var dTS = typeString(getType(d), alloc);
-    defer alloc.free(dTS);
+    var dTS = try typeString(getType(d), alloc);
     try stdout.print("The value of 'd' is of type: [{}]\n", .{dTS});
     std.testing.expect(isAcceptedType(getType(d), getType(d)));
+    alloc.free(dTS);
+}
+
+test "Simple Error" {
+    var alloc = std.testing.allocator;
+    var err = try ArrayList(ErrorEntry).initCapacity(alloc, 2);
+    try err.append(ErrorEntry{
+        .target = "Test 1",
+        .msg = "Testing a single error",
+    });
+    try printErrorList(err);
+    err.appendAssumeCapacity(ErrorEntry{
+        .target = "Test 2",
+        .msg = "Testing consequetive errors",
+    });
+    try printErrorList(err);
+    err.deinit();
+    var err3 = makeError("Test 3", "Testing makeError function", alloc);
+    try printErrorList(err3.errlst);
+    //var err4 = appendError(&err3, "Test 4", "Testing appendError function", alloc);
+    err3.errlst.deinit();
+    //err4.errlst.deinit();
 }
 
 test "Simple Execution" {
@@ -435,24 +482,31 @@ test "Simple Execution" {
         Action{
             .let = Assignment{
                 .name = "lambda_return_value",
-                .value = ResolvedAction{ .scalar = Scalar{ .integer = 5 } },
+                .value = ResolvedAction{ .integer = 5 },
             },
         },
     };
     var typeSig = ClosureT{
         .argumentList = ArrayList(Signature).init(alloc),
-        .returnType = ArgumentTypes{ .scalar = ScalarTypes.integer },
+        .returnType = ArgumentTypes{ .integer = 0 },
     };
     var lambda = Closure{
         .typeSignature = typeSig,
         .procedures = ArrayList(Action).fromOwnedSlice(alloc, actions[0..]),
     };
     var currentScope = HashMap(Assignment).init(alloc);
+    defer currentScope.deinit();
     var scopes = ArrayList(*HashMap(Assignment)).init(alloc);
     var result = execute(lambda, &currentScope, &scopes, alloc);
     scopes.deinit();
     var resT = getType(result);
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("The returned value is of type: [{}]\n", .{typeString(resT, alloc)});
-    std.testing.expect(isAcceptedType(resT, ArgumentTypes{ .scalar = ScalarTypes.integer }));
+    var tStr = try typeString(resT, alloc);
+    defer alloc.free(tStr);
+    try stdout.print("The returned value is of type: [{}]\n", .{tStr});
+    if (isAcceptedType(resT, ArgumentTypes{ .errlst = 0 })) {
+        try printErrorList(result.errlst);
+    } else {
+        std.testing.expect(isAcceptedType(resT, ArgumentTypes{ .integer = -1 }));
+    }
 }
